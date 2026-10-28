@@ -133,6 +133,18 @@ function idbDel(key) {
   });
 }
 
+function idbSaveAll(data, pin) {
+  return new Promise((resolve, reject) => {
+    const tx = idb.transaction(STORE, 'readwrite');
+    const st = tx.objectStore(STORE);
+    st.put(data, 'data');
+    if (pin) st.put(pin, 'pin'); else st.delete('pin');
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 /* ============ State ============ */
 let state = {
   association: null, members: [], cycles: [], payments: [], logs: [],
@@ -144,16 +156,14 @@ let formState = { orderMode: 'manual' };
 /* ============ Persistence ============ */
 async function save() {
   try {
-    await idbPut('data', {
+    await idbSaveAll({
       association: state.association,
       members: state.members,
       cycles: state.cycles,
       payments: state.payments,
       logs: state.logs,
       lastExportDate: state.lastExportDate
-    });
-    if (state.pin) await idbPut('pin', state.pin);
-    else await idbDel('pin');
+    }, state.pin);
     return true;
   } catch (e) {
     console.error('Save failed:', e);
@@ -180,7 +190,9 @@ async function load() {
 async function persist() {
   const ok = await save();
   if (!ok) {
+    const wasAuthed = state.authed;
     await load();
+    state.authed = wasAuthed;
     render();
     showToast('❌ فشل الحفظ — لم يتم التعديل');
     return false;
@@ -198,7 +210,14 @@ function money(n) {
   const c = state.association?.currency?.trim() || '';
   return fmt(n) + (c ? ' ' + c : '');
 }
-function uid(p) { return p + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).substr(2, 6); }
+function uid(p) { return p + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
+function r2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+let busy = false;
+async function once(fn) {
+  if (busy) return;
+  busy = true;
+  try { await fn(); } finally { busy = false; }
+}
 function todayISO() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -234,7 +253,7 @@ function showUndoToast(msg, undoFn) {
   if (old) old.remove();
   const t = document.createElement('div');
   t.className = 'toast toast-undo';
-  t.innerHTML = `<span>${msg}</span><button>تراجع</button>`;
+  t.innerHTML = `<span>${esc(msg)}</span><button>تراجع</button>`;
   t.querySelector('button').onclick = () => { t.remove(); undoFn(); };
   document.body.appendChild(t);
   setTimeout(() => { if (t.parentNode) { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); } }, 3500);
@@ -247,15 +266,15 @@ function getRequiredPerMember() { return state.cycles[0]?.requiredPerMember || 0
 function getVault() {
   const inn = state.payments.reduce((s, p) => s + p.amount, 0);
   const out = getPaidCycles().reduce((s, c) => s + c.totalAmount, 0);
-  return inn - out;
+  return r2(inn - out);
 }
 function getMemberStatus(member) {
   const pc = getPaidCycles().length;
   const tc = state.cycles.length;
   const req = getRequiredPerMember();
-  const tp = state.payments.filter(p => p.memberId === member.id).reduce((s, p) => s + p.amount, 0);
-  const need = pc >= tc ? 0 : Math.max(0, (pc + 1) * req - tp);
-  const credit = pc >= tc ? 0 : Math.max(0, tp - (pc + 1) * req);
+  const tp = r2(state.payments.filter(p => p.memberId === member.id).reduce((s, p) => s + p.amount, 0));
+  const need = pc >= tc ? 0 : r2(Math.max(0, (pc + 1) * req - tp));
+  const credit = pc >= tc ? 0 : r2(Math.max(0, tp - (pc + 1) * req));
   return { totalPaid: tp, neededForCurrent: need, creditAfter: credit, isReady: need === 0, req };
 }
 function getTodayPaid(memberId) {
@@ -310,7 +329,8 @@ async function createAssociation(data) {
   render();
 }
 
-async function quickPay(memberId) {
+function quickPay(memberId) { return once(() => doQuickPay(memberId)); }
+async function doQuickPay(memberId) {
   const m = state.members.find(x => x.id === memberId);
   if (!m) return;
   const amount = state.association.collectionAmount || getRequiredPerMember();
@@ -325,10 +345,11 @@ async function quickPay(memberId) {
   showToast(`✓ ${m.name} - ${money(amount)}`);
 }
 
-async function submitPayment(memberId) {
+function submitPayment(memberId) { return once(() => doSubmitPayment(memberId)); }
+async function doSubmitPayment(memberId) {
   const a = document.getElementById('pay-amount')?.value;
   const n = document.getElementById('pay-note')?.value || '';
-  const amount = parseFloat(a);
+  const amount = r2(parseFloat(a));
   if (!amount || amount <= 0) { showToast('أدخل مبلغاً صحيحاً'); return; }
   const m = state.members.find(x => x.id === memberId);
   if (!m) return;
@@ -350,10 +371,12 @@ function canDeletePayment(paymentId) {
   const after = total - p.amount;
   const min = pc * req;
   if (after < min) return { can: false, reason: `مقفل — العضو مدين لدورات مصروفة (ينقص ${fmt(min - after)})` };
+  if (getVault() - p.amount < 0) return { can: false, reason: 'مقفل — حذفها يجعل الخزينة بالسالب' };
   return { can: true };
 }
 
-async function deletePayment(paymentId) {
+function deletePayment(paymentId) { return once(() => doDeletePayment(paymentId)); }
+async function doDeletePayment(paymentId) {
   const p = state.payments.find(x => x.id === paymentId);
   if (!p) return;
   const check = canDeletePayment(paymentId);
@@ -373,9 +396,11 @@ async function deletePayment(paymentId) {
   });
 }
 
-async function payOutCurrentCycle() {
+function payOutCurrentCycle() { return once(doPayOutCurrentCycle); }
+async function doPayOutCurrentCycle() {
   const c = getCurrentCycle();
   if (!c) return;
+  if (todayISO() < c.dueDate) { showToast('لم يحل موعد الصرف'); closeModal(); return; }
   const v = getVault();
   if (v < c.totalAmount) { showToast('الخزينة لا تكفي'); closeModal(); return; }
   c.status = 'paid';
@@ -408,8 +433,10 @@ async function exportData() {
   const a = document.createElement('a');
   a.href = u;
   a.download = `jamiyati-backup-${todayISO()}.json`;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(u);
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 60000);
   state.lastExportDate = todayISO();
   await save();
   render();
@@ -425,12 +452,8 @@ async function importData(input) {
   let d;
   try { d = JSON.parse(text); }
   catch (e) { showToast('❌ ملف JSON غير صالح'); input.value = ''; return; }
-  if (!d || typeof d !== 'object'
-      || !d.association || typeof d.association !== 'object'
-      || !Array.isArray(d.members)
-      || !Array.isArray(d.cycles)
-      || !Array.isArray(d.payments)
-      || !Array.isArray(d.logs)) {
+  d = sanitizeImport(d);
+  if (!d) {
     showToast('❌ ملف غير صالح — تم رفضه');
     input.value = '';
     return;
@@ -446,6 +469,59 @@ async function importData(input) {
   render();
   showToast('تم استيراد البيانات');
   input.value = '';
+}
+
+/* Rebuilds an imported backup with clean types; returns null if anything is wrong */
+function sanitizeImport(d) {
+  const isObj = (x) => x && typeof x === 'object' && !Array.isArray(x);
+  const str = (x) => (x == null ? '' : String(x));
+  const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : NaN; };
+  const isDate = (x) => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x);
+  if (!isObj(d) || !isObj(d.association)
+      || !Array.isArray(d.members) || !Array.isArray(d.cycles)
+      || !Array.isArray(d.payments) || !Array.isArray(d.logs)) return null;
+  const a = d.association;
+  const association = {
+    id: str(a.id), name: str(a.name), currency: str(a.currency).slice(0, 20),
+    collectionAmount: num(a.collectionAmount),
+    collectionPeriod: ['daily', 'weekly', 'monthly'].includes(a.collectionPeriod) ? a.collectionPeriod : 'daily',
+    collectionDays: num(a.collectionDays), payoutPeriod: num(a.payoutPeriod),
+    startDate: str(a.startDate), requiredPerMember: num(a.requiredPerMember),
+    totalAmount: num(a.totalAmount), orderMode: a.orderMode === 'random' ? 'random' : 'manual',
+    createdAt: str(a.createdAt), status: a.status === 'archived' ? 'archived' : 'active'
+  };
+  if (!association.name || !(association.collectionAmount > 0) || !isDate(association.startDate)) return null;
+  const ids = new Set();
+  const members = [];
+  for (const m of d.members) {
+    if (!isObj(m) || !m.id || ids.has(str(m.id)) || !str(m.name).trim()) return null;
+    const order = num(m.order);
+    if (!Number.isInteger(order)) return null;
+    ids.add(str(m.id));
+    members.push({ id: str(m.id), name: str(m.name), phone: str(m.phone), order });
+  }
+  if (members.length < 2) return null;
+  const cycles = [];
+  for (const c of d.cycles) {
+    if (!isObj(c) || !ids.has(str(c.recipientMemberId)) || !isDate(c.dueDate)) return null;
+    const cycle = {
+      cycleIndex: num(c.cycleIndex), dueDate: c.dueDate, recipientMemberId: str(c.recipientMemberId),
+      requiredPerMember: num(c.requiredPerMember), totalAmount: num(c.totalAmount),
+      status: c.status === 'paid' ? 'paid' : 'pending', paidAt: c.paidAt ? str(c.paidAt) : null
+    };
+    if (!Number.isInteger(cycle.cycleIndex) || !(cycle.requiredPerMember > 0) || !(cycle.totalAmount > 0)) return null;
+    cycles.push(cycle);
+  }
+  if (cycles.length === 0) return null;
+  const payments = [];
+  for (const p of d.payments) {
+    if (!isObj(p) || !ids.has(str(p.memberId)) || !isDate(p.date)) return null;
+    const amount = r2(num(p.amount));
+    if (!(amount > 0)) return null;
+    payments.push({ id: str(p.id) || uid('P'), memberId: str(p.memberId), amount, date: p.date, note: str(p.note), createdAt: str(p.createdAt) });
+  }
+  const logs = d.logs.filter(isObj).map(l => ({ id: str(l.id) || uid('L'), timestamp: str(l.timestamp), action: str(l.action), details: str(l.details) }));
+  return { association, members, cycles, payments, logs };
 }
 
 async function resetAll() {
@@ -477,25 +553,33 @@ async function setPin() {
     return;
   }
   if (!/^\d{4}$/.test(p)) { showToast('يجب 4 أرقام'); return; }
+  const p2 = prompt('أعد إدخال الرمز للتأكيد:');
+  if (p2 === null) return;
+  if (p2 !== p) { showToast('الرمزان غير متطابقين — لم يتغير شيء'); return; }
   state.pin = p;
   if (!await persist()) return;
   render();
   showToast('تم تعيين الرمز');
 }
 
-function finishAndStartNew() {
+async function finishAndStartNew() {
   if (!confirm('سيتم تنزيل نسخة احتياطية من الجمعية الحالية، ثم البدء من جديد.')) return;
-  exportData();
+  await exportData();
   setTimeout(async () => {
+    if (!confirm('هل تأكدت أن ملف النسخة الاحتياطية نزل على جهازك؟\n\nاضغط "موافق" فقط إذا وجدت الملف. سيتم بعدها حذف الجمعية الحالية من التطبيق.')) {
+      showToast('لم يُحذف شيء — يمكنك إعادة المحاولة');
+      return;
+    }
     state.association = null;
     state.members = [];
     state.cycles = [];
     state.payments = [];
     state.logs = [];
+    state.view = 'main';
     try { await idbDel('data'); } catch (e) { console.error(e); }
     render();
     showToast('ابدأ جمعية جديدة');
-  }, 600);
+  }, 1000);
 }
 
 /* ============ Rendering ============ */
@@ -539,13 +623,20 @@ function renderPinScreen() {
     </div>
   </div>`;
 }
+let pinFails = 0, pinLockUntil = 0;
 function pressPin(d) {
+  if (Date.now() < pinLockUntil) { showToast(`محاولات كثيرة — انتظر ${Math.ceil((pinLockUntil - Date.now()) / 1000)} ثانية`); return; }
   if (state.pinInput.length >= 4) return;
   state.pinInput += d;
   if (state.pinInput.length === 4) {
     setTimeout(() => {
-      if (state.pinInput === state.pin) { state.authed = true; state.pinInput = ''; }
-      else { state.pinInput = ''; showToast('رمز خاطئ'); }
+      if (state.pinInput === state.pin) { state.authed = true; state.pinInput = ''; pinFails = 0; }
+      else {
+        state.pinInput = '';
+        pinFails++;
+        if (pinFails >= 5) { pinLockUntil = Date.now() + 30000; pinFails = 0; showToast('5 محاولات خاطئة — انتظر 30 ثانية'); }
+        else showToast('رمز خاطئ');
+      }
       render();
     }, 150);
   } else render();
@@ -717,7 +808,7 @@ function renderMainScreen() {
     const canPay = isDue && enough;
     const progress = Math.min(100, Math.round((v / cur.totalAmount) * 100));
     hero = `<div class="hero-card">
-      <div class="hero-label">الدورة الحالية #${cur.cycleIndex} من ${tc}</div>
+      <div class="hero-label">الدورة الحالية #${esc(cur.cycleIndex)} من ${tc}</div>
       <div class="hero-value">${money(cur.totalAmount)}</div>
       <div class="progress-container"><div class="progress-fill" style="width:${progress}%"></div></div>
       <div class="progress-label"><span>تم جمع ${money(Math.min(v, cur.totalAmount))}</span><span>${progress}%</span></div>
@@ -765,7 +856,7 @@ function renderMainScreen() {
     else { badge = `يحتاج ${fmt(s.neededForCurrent)}`; bc = s.neededForCurrent >= req ? 'badge-danger' : 'badge-warning'; }
     const phoneRow = m.phone ? `<div style="font-size:11px;margin-top:3px;display:flex;gap:8px;flex-wrap:wrap">
       <a href="tel:${esc(m.phone)}" style="color:var(--brand-dark);text-decoration:none" onclick="event.stopPropagation()">📞 ${esc(m.phone)}</a>
-      <a href="https://wa.me/${m.phone.replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" style="color:#25d366;text-decoration:none" onclick="event.stopPropagation()">💬 واتساب</a>
+      <a href="https://wa.me/${String(m.phone).replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" style="color:#25d366;text-decoration:none" onclick="event.stopPropagation()">💬 واتساب</a>
     </div>` : '';
     return `<div class="member-item" onclick="openPaymentModal(${JSON.stringify(m.id).replace(/"/g,'&quot;')})">
       <div class="member-item-left">
@@ -863,7 +954,7 @@ function renderHistoryScreen() {
     : pc.map(c => {
         const r = state.members.find(m => m.id === c.recipientMemberId);
         return `<div style="padding:10px;background:var(--bg);border-radius:10px;margin-bottom:8px">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>الدورة ${c.cycleIndex}</strong><span class="badge badge-success">مصروفة</span></div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>الدورة ${esc(c.cycleIndex)}</strong><span class="badge badge-success">مصروفة</span></div>
           <div style="font-size:12px;color:var(--muted)">المستلم: ${esc(r?.name || '—')}</div>
           <div style="font-size:12px;margin-top:4px">المبلغ: <strong>${money(c.totalAmount)}</strong></div>
           <div style="font-size:11px;color:var(--muted);margin-top:4px">تاريخ الصرف: ${formatDate(c.paidAt?.split('T')[0])}</div>
@@ -902,7 +993,7 @@ function renderSettingsScreen() {
         <button class="btn btn-outline btn-block" style="margin-top:8px" onclick="setPin()">${state.pin?'🔑 تغيير الرمز':'🔒 تعيين رمز'}</button>
       </div>
       <div class="card"><h2 class="card-title">معلومات</h2>
-        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.2.0</span></div>
+        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.3.0</span></div>
         <div class="stat-row"><span class="stat-label">التخزين</span><span class="stat-value">IndexedDB</span></div>
         <div class="stat-row"><span class="stat-label">الاسم</span><span class="stat-value">${esc(state.association?.name || '—')}</span></div>
         <div class="stat-row"><span class="stat-label">العملة</span><span class="stat-value">${esc(state.association?.currency || '—')}</span></div>
@@ -951,7 +1042,7 @@ function openPaymentModal(memberId) {
     : '';
   const phoneRow = m.phone ? `<div style="display:flex;gap:8px;margin-bottom:10px;font-size:12px">
     <a href="tel:${esc(m.phone)}" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none">📞 اتصال</a>
-    <a href="https://wa.me/${m.phone.replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none;color:#25d366">💬 واتساب</a>
+    <a href="https://wa.me/${String(m.phone).replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none;color:#25d366">💬 واتساب</a>
   </div>` : '';
   openModal(`
     <div class="modal-title"><span>📋 دفعات ${esc(m.name)}</span><button class="modal-close" onclick="closeModal()">×</button></div>
@@ -962,11 +1053,11 @@ function openPaymentModal(memberId) {
     ${phoneRow}
     <div class="field"><label class="label">➕ إضافة دفعة</label>
       <div class="quick-amounts">
-        <button onclick="setPayAmount(${quickAmount})">${fmt(quickAmount)}</button>
-        <button onclick="setPayAmount(${quickAmount * 2})">${fmt(quickAmount * 2)}</button>
-        ${s.neededForCurrent > 0 && s.neededForCurrent !== quickAmount ? `<button onclick="setPayAmount(${s.neededForCurrent})">المتبقي (${fmt(s.neededForCurrent)})</button>` : ''}
+        <button onclick="setPayAmount(${Number(quickAmount)})">${fmt(quickAmount)}</button>
+        <button onclick="setPayAmount(${Number(quickAmount) * 2})">${fmt(quickAmount * 2)}</button>
+        ${s.neededForCurrent > 0 && s.neededForCurrent !== quickAmount ? `<button onclick="setPayAmount(${Number(s.neededForCurrent)})">المتبقي (${fmt(s.neededForCurrent)})</button>` : ''}
       </div>
-      <input type="number" class="input" id="pay-amount" placeholder="0" min="1" value="${s.neededForCurrent||''}">
+      <input type="number" class="input" id="pay-amount" placeholder="0" min="1" value="${Number(s.neededForCurrent)||''}">
     </div>
     <div class="field"><input type="text" class="input" id="pay-note" placeholder="ملاحظة (اختياري)"></div>
     <button class="btn btn-primary btn-block" onclick="submitPayment(${JSON.stringify(memberId).replace(/"/g,'&quot;')})">+ تسجيل الدفعة</button>
@@ -988,7 +1079,7 @@ function openPayoutModal() {
   if (v < c.totalAmount) { showToast(`الخزينة ناقصة ${fmt(c.totalAmount - v)}`); return; }
   const r = state.members.find(m => m.id === c.recipientMemberId);
   openModal(`
-    <div class="modal-title"><span>صرف الدورة #${c.cycleIndex}</span><button class="modal-close" onclick="closeModal()">×</button></div>
+    <div class="modal-title"><span>صرف الدورة #${esc(c.cycleIndex)}</span><button class="modal-close" onclick="closeModal()">×</button></div>
     <div style="background:var(--bg);padding:12px;border-radius:12px;margin-bottom:12px;font-size:13px">
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>المستلم:</span><strong>${esc(r?.name || '—')}</strong></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>المبلغ:</span><strong style="color:var(--brand-dark)">${money(c.totalAmount)}</strong></div>
@@ -1001,8 +1092,14 @@ function openPayoutModal() {
   `);
 }
 
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
 /* ============ Init ============ */
 async function init() {
+  // Ask the browser not to auto-delete our data when the device is low on space
+  try { if (navigator.storage?.persist) await navigator.storage.persist(); } catch (e) { console.warn(e); }
   document.getElementById('app').innerHTML = '<div style="padding:60px;text-align:center;color:#64748b"><div style="font-size:32px;margin-bottom:12px">📒</div><div>جارٍ التحميل...</div></div>';
   try {
     await openIndexedDB();
