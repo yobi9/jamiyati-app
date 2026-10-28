@@ -498,7 +498,10 @@ function sanitizeImport(d) {
     const order = num(m.order);
     if (!Number.isInteger(order)) return null;
     ids.add(str(m.id));
-    members.push({ id: str(m.id), name: str(m.name), phone: str(m.phone), order });
+    const previousNames = Array.isArray(m.previousNames)
+      ? m.previousNames.filter(isObj).map(x => ({ name: str(x.name), phone: str(x.phone), until: str(x.until) }))
+      : [];
+    members.push({ id: str(m.id), name: str(m.name), phone: str(m.phone), order, previousNames });
   }
   if (members.length < 2) return null;
   const cycles = [];
@@ -993,7 +996,7 @@ function renderSettingsScreen() {
         <button class="btn btn-outline btn-block" style="margin-top:8px" onclick="setPin()">${state.pin?'🔑 تغيير الرمز':'🔒 تعيين رمز'}</button>
       </div>
       <div class="card"><h2 class="card-title">معلومات</h2>
-        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.3.0</span></div>
+        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.4.0</span></div>
         <div class="stat-row"><span class="stat-label">التخزين</span><span class="stat-value">IndexedDB</span></div>
         <div class="stat-row"><span class="stat-label">الاسم</span><span class="stat-value">${esc(state.association?.name || '—')}</span></div>
         <div class="stat-row"><span class="stat-label">العملة</span><span class="stat-value">${esc(state.association?.currency || '—')}</span></div>
@@ -1046,6 +1049,7 @@ function openPaymentModal(memberId) {
   </div>` : '';
   openModal(`
     <div class="modal-title"><span>📋 دفعات ${esc(m.name)}</span><button class="modal-close" onclick="closeModal()">×</button></div>
+    <button class="btn btn-outline btn-block btn-sm" style="margin-bottom:10px" onclick="openEditMemberModal(${JSON.stringify(memberId).replace(/"/g,'&quot;')})">✏️ تعديل بيانات العضو أو دوره</button>
     <div style="background:var(--brand-light);padding:10px;border-radius:10px;margin-bottom:12px;font-size:12px;color:#065f46">
       <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span>مجموع المدفوع:</span><strong>${money(s.totalPaid)}</strong></div>
       <div style="display:flex;justify-content:space-between"><span>الحالة:</span><strong>${s.neededForCurrent===0?'✅ جاهز للدورة':'يحتاج: '+fmt(s.neededForCurrent)}</strong></div>
@@ -1069,6 +1073,87 @@ function openPaymentModal(memberId) {
     <button class="btn btn-outline btn-block" onclick="closeModal()" style="margin-top:12px">إغلاق</button>
   `);
   setTimeout(() => document.getElementById('pay-amount')?.focus(), 100);
+}
+
+/* ============ Edit Member ============ */
+function openEditMemberModal(memberId) {
+  const m = state.members.find(x => x.id === memberId);
+  if (!m) return;
+  const myCycle = state.cycles.find(c => c.recipientMemberId === memberId);
+  const received = myCycle?.status === 'paid';
+  const idArg = JSON.stringify(memberId).replace(/"/g,'&quot;');
+  const orderField = received
+    ? `<div style="font-size:12px;color:var(--muted);background:var(--bg);padding:8px;border-radius:8px">استلم هذا العضو دوره (الدورة ${esc(myCycle.cycleIndex)}) — لا يمكن تغيير دوره.</div>`
+    : `<select class="select" id="edit-order">${state.cycles
+        .filter(c => c.status === 'pending')
+        .sort((a, b) => a.cycleIndex - b.cycleIndex)
+        .map(c => {
+          const r = state.members.find(x => x.id === c.recipientMemberId);
+          const label = c.recipientMemberId === memberId ? '(دوره الحالي)' : `مكان ${esc(r?.name || '—')}`;
+          return `<option value="${Number(c.cycleIndex)}" ${c.recipientMemberId === memberId ? 'selected' : ''}>الدور ${esc(c.cycleIndex)} — ${formatDate(c.dueDate)} ${label}</option>`;
+        }).join('')}</select>
+       <div style="font-size:11px;color:var(--muted);margin-top:4px">عند اختيار دور آخر يتبادل العضوان الدورين.</div>`;
+  const replaceField = received
+    ? ''
+    : `<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;background:#fef3c7;padding:10px;border-radius:10px;cursor:pointer">
+        <input type="checkbox" id="edit-replace" style="margin-top:3px">
+        <span>هذا <strong>عضو جديد</strong> يحل محل عضو انسحب.<br><span style="font-size:11px;color:#92400e">يأخذ العضو الجديد نفس الدور ونفس الرصيد المدفوع (${money(getMemberStatus(m).totalPaid)}). تسوية هذا المبلغ مع العضو المنسحب تتم بينكم خارج التطبيق.</span></span>
+      </label>`;
+  openModal(`
+    <div class="modal-title"><span>✏️ تعديل العضو</span><button class="modal-close" onclick="openPaymentModal(${idArg})">×</button></div>
+    <div class="field"><label class="label">الاسم *</label><input type="text" class="input" id="edit-name" value="${esc(m.name)}"></div>
+    <div class="field"><label class="label">الهاتف (اختياري)</label><input type="tel" class="input" id="edit-phone" value="${esc(m.phone)}"></div>
+    <div class="field"><label class="label">الدور</label>${orderField}</div>
+    ${replaceField}
+    <div class="row" style="margin-top:12px">
+      <button class="btn btn-outline" onclick="openPaymentModal(${idArg})" style="flex:1">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveMember(${idArg})" style="flex:2">حفظ</button>
+    </div>
+  `);
+}
+
+function saveMember(memberId) { return once(() => doSaveMember(memberId)); }
+async function doSaveMember(memberId) {
+  const m = state.members.find(x => x.id === memberId);
+  if (!m) return;
+  const name = document.getElementById('edit-name')?.value.trim() || '';
+  const phone = document.getElementById('edit-phone')?.value.trim() || '';
+  const newIndex = parseInt(document.getElementById('edit-order')?.value);
+  const isReplace = !!document.getElementById('edit-replace')?.checked;
+  if (!name) { showToast('أدخل اسم العضو'); return; }
+
+  const myCycle = state.cycles.find(c => c.recipientMemberId === memberId);
+  const target = Number.isInteger(newIndex) ? state.cycles.find(c => c.cycleIndex === newIndex) : null;
+  const swap = target && myCycle && target !== myCycle;
+  if (swap && (myCycle.status !== 'pending' || target.status !== 'pending')) { showToast('لا يمكن تغيير دور تم صرفه'); return; }
+
+  const oldName = m.name;
+  const changed = name !== m.name || phone !== m.phone || swap;
+  if (!changed) { openPaymentModal(memberId); return; }
+
+  const now = new Date().toISOString();
+  if (isReplace) {
+    m.previousNames = [...(m.previousNames || []), { name: m.name, phone: m.phone, until: now }];
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'استبدال عضو', details: `${oldName} ← ${name} (الدور ${myCycle?.cycleIndex ?? '—'})` });
+  } else if (name !== m.name || phone !== m.phone) {
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'تعديل عضو', details: name !== oldName ? `${oldName} ← ${name}` : `${name} - تغيير الهاتف` });
+  }
+  m.name = name;
+  m.phone = phone;
+
+  if (swap) {
+    const other = state.members.find(x => x.id === target.recipientMemberId);
+    target.recipientMemberId = m.id;
+    myCycle.recipientMemberId = other.id;
+    m.order = target.cycleIndex;
+    other.order = myCycle.cycleIndex;
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'تغيير الدور', details: `${m.name} ↔ ${other.name} (الدور ${target.cycleIndex} و ${myCycle.cycleIndex})` });
+  }
+
+  if (!await persist()) return;
+  render();
+  openPaymentModal(memberId);
+  showToast('تم حفظ التعديل');
 }
 
 function openPayoutModal() {
