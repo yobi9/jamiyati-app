@@ -133,6 +133,18 @@ function idbDel(key) {
   });
 }
 
+function idbSaveAll(data, pin) {
+  return new Promise((resolve, reject) => {
+    const tx = idb.transaction(STORE, 'readwrite');
+    const st = tx.objectStore(STORE);
+    st.put(data, 'data');
+    if (pin) st.put(pin, 'pin'); else st.delete('pin');
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 /* ============ State ============ */
 let state = {
   association: null, members: [], cycles: [], payments: [], logs: [],
@@ -144,16 +156,14 @@ let formState = { orderMode: 'manual' };
 /* ============ Persistence ============ */
 async function save() {
   try {
-    await idbPut('data', {
+    await idbSaveAll({
       association: state.association,
       members: state.members,
       cycles: state.cycles,
       payments: state.payments,
       logs: state.logs,
       lastExportDate: state.lastExportDate
-    });
-    if (state.pin) await idbPut('pin', state.pin);
-    else await idbDel('pin');
+    }, state.pin);
     return true;
   } catch (e) {
     console.error('Save failed:', e);
@@ -180,7 +190,9 @@ async function load() {
 async function persist() {
   const ok = await save();
   if (!ok) {
+    const wasAuthed = state.authed;
     await load();
+    state.authed = wasAuthed;
     render();
     showToast('❌ فشل الحفظ — لم يتم التعديل');
     return false;
@@ -198,7 +210,14 @@ function money(n) {
   const c = state.association?.currency?.trim() || '';
   return fmt(n) + (c ? ' ' + c : '');
 }
-function uid(p) { return p + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).substr(2, 6); }
+function uid(p) { return p + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
+function r2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+let busy = false;
+async function once(fn) {
+  if (busy) return;
+  busy = true;
+  try { await fn(); } finally { busy = false; }
+}
 function todayISO() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -214,11 +233,45 @@ function daysSince(iso) {
   const today = new Date(todayISO() + 'T00:00:00');
   return Math.floor((today - last) / (1000 * 60 * 60 * 24));
 }
+const MONTHS_AR = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
 function formatDate(iso) {
   if (!iso) return '—';
   const d = new Date(iso + 'T00:00:00');
-  const m = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
-  return `${d.getDate()} ${m[d.getMonth()]} ${d.getFullYear()}`;
+  if (isNaN(d)) return '—';
+  return `${d.getDate()} ${MONTHS_AR[d.getMonth()]} ${d.getFullYear()}`;
+}
+// Full timestamp (when something was recorded) in local time
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  if (!ts || isNaN(d)) return '—';
+  return `${d.getDate()} ${MONTHS_AR[d.getMonth()]} ${d.getFullYear()} — ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+function isValidISODate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + 'T00:00:00');
+  if (isNaN(d)) return false;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}` === s;
+}
+// Returns an error message, or '' if the payment date is acceptable
+function checkPaymentDate(date) {
+  if (!isValidISODate(date)) return 'تاريخ الدفعة غير صالح';
+  if (date > todayISO()) return 'لا يمكن تسجيل دفعة بتاريخ في المستقبل';
+  const min = getMinPaymentDate();
+  if (min && date < min) return `تاريخ الدفعة قبل بداية الجمعية (${formatDate(min)})`;
+  return '';
+}
+// Earliest acceptable payment date: the start date, or the creation day if that came first
+function getMinPaymentDate() {
+  const a = state.association;
+  if (!a) return '';
+  const created = a.createdAt ? toLocalISO(new Date(a.createdAt)) : '';
+  const start = isValidISODate(a.startDate) ? a.startDate : '';
+  if (start && isValidISODate(created)) return created < start ? created : start;
+  return start;
+}
+function toLocalISO(d) {
+  if (isNaN(d)) return '';
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 function showToast(msg) {
   const old = document.querySelector('.toast');
@@ -234,7 +287,7 @@ function showUndoToast(msg, undoFn) {
   if (old) old.remove();
   const t = document.createElement('div');
   t.className = 'toast toast-undo';
-  t.innerHTML = `<span>${msg}</span><button>تراجع</button>`;
+  t.innerHTML = `<span>${esc(msg)}</span><button>تراجع</button>`;
   t.querySelector('button').onclick = () => { t.remove(); undoFn(); };
   document.body.appendChild(t);
   setTimeout(() => { if (t.parentNode) { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); } }, 3500);
@@ -247,15 +300,15 @@ function getRequiredPerMember() { return state.cycles[0]?.requiredPerMember || 0
 function getVault() {
   const inn = state.payments.reduce((s, p) => s + p.amount, 0);
   const out = getPaidCycles().reduce((s, c) => s + c.totalAmount, 0);
-  return inn - out;
+  return r2(inn - out);
 }
 function getMemberStatus(member) {
   const pc = getPaidCycles().length;
   const tc = state.cycles.length;
   const req = getRequiredPerMember();
-  const tp = state.payments.filter(p => p.memberId === member.id).reduce((s, p) => s + p.amount, 0);
-  const need = pc >= tc ? 0 : Math.max(0, (pc + 1) * req - tp);
-  const credit = pc >= tc ? 0 : Math.max(0, tp - (pc + 1) * req);
+  const tp = r2(state.payments.filter(p => p.memberId === member.id).reduce((s, p) => s + p.amount, 0));
+  const need = pc >= tc ? 0 : r2(Math.max(0, (pc + 1) * req - tp));
+  const credit = pc >= tc ? 0 : r2(Math.max(0, tp - (pc + 1) * req));
   return { totalPaid: tp, neededForCurrent: need, creditAfter: credit, isReady: need === 0, req };
 }
 function getTodayPaid(memberId) {
@@ -310,7 +363,8 @@ async function createAssociation(data) {
   render();
 }
 
-async function quickPay(memberId) {
+function quickPay(memberId) { return once(() => doQuickPay(memberId)); }
+async function doQuickPay(memberId) {
   const m = state.members.find(x => x.id === memberId);
   if (!m) return;
   const amount = state.association.collectionAmount || getRequiredPerMember();
@@ -319,41 +373,66 @@ async function quickPay(memberId) {
     date: todayISO(), note: 'دفعة سريعة',
     createdAt: new Date().toISOString()
   });
-  state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'دفعة سريعة', details: `${m.name} - ${fmt(amount)}` });
+  state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'دفعة سريعة', details: `${m.name} - ${fmt(amount)}`, paymentDate: todayISO() });
   if (!await persist()) return;
   render();
   showToast(`✓ ${m.name} - ${money(amount)}`);
 }
 
-async function submitPayment(memberId) {
+function submitPayment(memberId) { return once(() => doSubmitPayment(memberId)); }
+async function doSubmitPayment(memberId) {
   const a = document.getElementById('pay-amount')?.value;
   const n = document.getElementById('pay-note')?.value || '';
-  const amount = parseFloat(a);
+  const dateEl = document.getElementById('pay-date');
+  const date = dateEl ? dateEl.value : todayISO();
+  if (!date) { showToast('اختر تاريخ الدفعة'); return; }
+  const amount = r2(parseFloat(a));
   if (!amount || amount <= 0) { showToast('أدخل مبلغاً صحيحاً'); return; }
+  const dateErr = checkPaymentDate(date);
+  if (dateErr) { showToast(dateErr); return; }
   const m = state.members.find(x => x.id === memberId);
   if (!m) return;
-  state.payments.push({ id: uid('P'), memberId, amount, date: todayISO(), note: n, createdAt: new Date().toISOString() });
-  state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'دفعة', details: `${m.name} دفع ${fmt(amount)}` });
+  const same = state.payments.find(p => p.memberId === memberId && p.date === date && p.amount === amount);
+  if (same && !confirm(`توجد دفعة مسجلة لـ ${m.name} بنفس المبلغ (${fmt(amount)}) ونفس التاريخ (${formatDate(date)}).\n\nهل هذه دفعة أخرى فعلاً؟\nاضغط "إلغاء" إذا كانت نفس الدفعة.`)) return;
+  const now = new Date().toISOString();
+  const backdated = date !== todayISO();
+  state.payments.push({ id: uid('P'), memberId, amount, date, note: n, createdAt: now });
+  state.logs.unshift({ id: uid('L'), timestamp: now, action: backdated ? 'دفعة بتاريخ سابق' : 'دفعة', details: `${m.name} دفع ${fmt(amount)}`, paymentDate: date });
   if (!await persist()) return;
   render();
   openPaymentModal(memberId);
   showToast('تم تسجيل الدفعة');
 }
 
-function canDeletePayment(paymentId) {
+function getLastPayoutAt() {
+  return getPaidCycles().reduce((mx, c) => (c.paidAt && c.paidAt > mx ? c.paidAt : mx), '');
+}
+// A payment recorded before the latest payout was part of the vault that paid a closed cycle
+function isPaymentLocked(p) {
+  const last = getLastPayoutAt();
+  if (!last) return false;
+  return (p.createdAt || p.date) <= last;
+}
+const LOCKED_REASON = 'مقفلة — سُجّلت قبل صرف دورة، فهي جزء من حساب مغلق. لتصحيح نقص سجّل دفعة إضافية.';
+// Can this payment's amount become newAmount (0 = delete)?
+function checkPaymentChange(paymentId, newAmount) {
   const p = state.payments.find(x => x.id === paymentId);
   if (!p) return { can: false, reason: 'الدفعة غير موجودة' };
-  const pc = getPaidCycles().length;
-  if (pc === 0) return { can: true };
-  const req = getRequiredPerMember();
-  const total = state.payments.filter(x => x.memberId === p.memberId).reduce((s, x) => s + x.amount, 0);
-  const after = total - p.amount;
-  const min = pc * req;
-  if (after < min) return { can: false, reason: `مقفل — العضو مدين لدورات مصروفة (ينقص ${fmt(min - after)})` };
+  if (isPaymentLocked(p)) return { can: false, reason: LOCKED_REASON };
+  const vaultAfter = r2(getVault() - p.amount + newAmount);
+  if (vaultAfter < 0) return { can: false, reason: `مرفوض — الخزينة ستصبح بالسالب (${fmt(vaultAfter)})` };
+  return { can: true };
+}
+function canDeletePayment(paymentId) { return checkPaymentChange(paymentId, 0); }
+function canEditPayment(paymentId) {
+  const p = state.payments.find(x => x.id === paymentId);
+  if (!p) return { can: false, reason: 'الدفعة غير موجودة' };
+  if (isPaymentLocked(p)) return { can: false, reason: LOCKED_REASON };
   return { can: true };
 }
 
-async function deletePayment(paymentId) {
+function deletePayment(paymentId) { return once(() => doDeletePayment(paymentId)); }
+async function doDeletePayment(paymentId) {
   const p = state.payments.find(x => x.id === paymentId);
   if (!p) return;
   const check = canDeletePayment(paymentId);
@@ -362,20 +441,22 @@ async function deletePayment(paymentId) {
   const originalIndex = state.payments.findIndex(x => x.id === paymentId);
   const deletedCopy = { ...p };
   state.payments = state.payments.filter(x => x.id !== paymentId);
-  state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'حذف دفعة', details: `${m?.name || ''} - ${fmt(p.amount)}` });
+  state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'حذف دفعة', details: `${m?.name || ''} - ${fmt(p.amount)}`, paymentDate: p.date });
   if (!await persist()) return;
   closeModal();
   render();
   showUndoToast(`حُذفت دفعة ${fmt(p.amount)}`, async () => {
     state.payments.splice(originalIndex, 0, deletedCopy);
-    state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'تراجع عن حذف', details: `${m?.name || ''} - ${fmt(deletedCopy.amount)}` });
+    state.logs.unshift({ id: uid('L'), timestamp: new Date().toISOString(), action: 'تراجع عن حذف', details: `${m?.name || ''} - ${fmt(deletedCopy.amount)}`, paymentDate: deletedCopy.date });
     if (await persist()) { render(); showToast('تم التراجع'); }
   });
 }
 
-async function payOutCurrentCycle() {
+function payOutCurrentCycle() { return once(doPayOutCurrentCycle); }
+async function doPayOutCurrentCycle() {
   const c = getCurrentCycle();
   if (!c) return;
+  if (todayISO() < c.dueDate) { showToast('لم يحل موعد الصرف'); closeModal(); return; }
   const v = getVault();
   if (v < c.totalAmount) { showToast('الخزينة لا تكفي'); closeModal(); return; }
   c.status = 'paid';
@@ -408,8 +489,10 @@ async function exportData() {
   const a = document.createElement('a');
   a.href = u;
   a.download = `jamiyati-backup-${todayISO()}.json`;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(u);
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 60000);
   state.lastExportDate = todayISO();
   await save();
   render();
@@ -425,12 +508,8 @@ async function importData(input) {
   let d;
   try { d = JSON.parse(text); }
   catch (e) { showToast('❌ ملف JSON غير صالح'); input.value = ''; return; }
-  if (!d || typeof d !== 'object'
-      || !d.association || typeof d.association !== 'object'
-      || !Array.isArray(d.members)
-      || !Array.isArray(d.cycles)
-      || !Array.isArray(d.payments)
-      || !Array.isArray(d.logs)) {
+  d = sanitizeImport(d);
+  if (!d) {
     showToast('❌ ملف غير صالح — تم رفضه');
     input.value = '';
     return;
@@ -446,6 +525,71 @@ async function importData(input) {
   render();
   showToast('تم استيراد البيانات');
   input.value = '';
+}
+
+/* Rebuilds an imported backup with clean types; returns null if anything is wrong */
+function sanitizeImport(d) {
+  const isObj = (x) => x && typeof x === 'object' && !Array.isArray(x);
+  const str = (x) => (x == null ? '' : String(x));
+  const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : NaN; };
+  const isDate = (x) => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x);
+  if (!isObj(d) || !isObj(d.association)
+      || !Array.isArray(d.members) || !Array.isArray(d.cycles)
+      || !Array.isArray(d.payments) || !Array.isArray(d.logs)) return null;
+  const a = d.association;
+  const association = {
+    id: str(a.id), name: str(a.name), currency: str(a.currency).slice(0, 20),
+    collectionAmount: num(a.collectionAmount),
+    collectionPeriod: ['daily', 'weekly', 'monthly'].includes(a.collectionPeriod) ? a.collectionPeriod : 'daily',
+    collectionDays: num(a.collectionDays), payoutPeriod: num(a.payoutPeriod),
+    startDate: str(a.startDate), requiredPerMember: num(a.requiredPerMember),
+    totalAmount: num(a.totalAmount), orderMode: a.orderMode === 'random' ? 'random' : 'manual',
+    createdAt: str(a.createdAt), status: a.status === 'archived' ? 'archived' : 'active'
+  };
+  if (!association.name || !(association.collectionAmount > 0) || !isDate(association.startDate)) return null;
+  const ids = new Set();
+  const members = [];
+  for (const m of d.members) {
+    if (!isObj(m) || !m.id || ids.has(str(m.id)) || !str(m.name).trim()) return null;
+    const order = num(m.order);
+    if (!Number.isInteger(order)) return null;
+    ids.add(str(m.id));
+    const previousNames = Array.isArray(m.previousNames)
+      ? m.previousNames.filter(isObj).map(x => ({ name: str(x.name), phone: str(x.phone), until: str(x.until) }))
+      : [];
+    members.push({ id: str(m.id), name: str(m.name), phone: str(m.phone), order, previousNames });
+  }
+  if (members.length < 2) return null;
+  const cycles = [];
+  for (const c of d.cycles) {
+    if (!isObj(c) || !ids.has(str(c.recipientMemberId)) || !isDate(c.dueDate)) return null;
+    const cycle = {
+      cycleIndex: num(c.cycleIndex), dueDate: c.dueDate, recipientMemberId: str(c.recipientMemberId),
+      requiredPerMember: num(c.requiredPerMember), totalAmount: num(c.totalAmount),
+      status: c.status === 'paid' ? 'paid' : 'pending', paidAt: c.paidAt ? str(c.paidAt) : null
+    };
+    if (!Number.isInteger(cycle.cycleIndex) || !(cycle.requiredPerMember > 0) || !(cycle.totalAmount > 0)) return null;
+    cycles.push(cycle);
+  }
+  if (cycles.length === 0) return null;
+  const payments = [];
+  for (const p of d.payments) {
+    if (!isObj(p) || !ids.has(str(p.memberId)) || !isDate(p.date)) return null;
+    const amount = r2(num(p.amount));
+    if (!(amount > 0)) return null;
+    const pay = { id: str(p.id) || uid('P'), memberId: str(p.memberId), amount, date: p.date, note: str(p.note), createdAt: str(p.createdAt) };
+    if (p.editedAt) pay.editedAt = str(p.editedAt);
+    if (Array.isArray(p.history)) {
+      pay.history = p.history.filter(isObj).map(h => ({ amount: r2(num(h.amount)), date: isDate(h.date) ? h.date : '', note: str(h.note), editedAt: str(h.editedAt) }));
+    }
+    payments.push(pay);
+  }
+  const logs = d.logs.filter(isObj).map(l => {
+    const log = { id: str(l.id) || uid('L'), timestamp: str(l.timestamp), action: str(l.action), details: str(l.details) };
+    if (isDate(l.paymentDate)) log.paymentDate = l.paymentDate;
+    return log;
+  });
+  return { association, members, cycles, payments, logs };
 }
 
 async function resetAll() {
@@ -477,25 +621,33 @@ async function setPin() {
     return;
   }
   if (!/^\d{4}$/.test(p)) { showToast('يجب 4 أرقام'); return; }
+  const p2 = prompt('أعد إدخال الرمز للتأكيد:');
+  if (p2 === null) return;
+  if (p2 !== p) { showToast('الرمزان غير متطابقين — لم يتغير شيء'); return; }
   state.pin = p;
   if (!await persist()) return;
   render();
   showToast('تم تعيين الرمز');
 }
 
-function finishAndStartNew() {
+async function finishAndStartNew() {
   if (!confirm('سيتم تنزيل نسخة احتياطية من الجمعية الحالية، ثم البدء من جديد.')) return;
-  exportData();
+  await exportData();
   setTimeout(async () => {
+    if (!confirm('هل تأكدت أن ملف النسخة الاحتياطية نزل على جهازك؟\n\nاضغط "موافق" فقط إذا وجدت الملف. سيتم بعدها حذف الجمعية الحالية من التطبيق.')) {
+      showToast('لم يُحذف شيء — يمكنك إعادة المحاولة');
+      return;
+    }
     state.association = null;
     state.members = [];
     state.cycles = [];
     state.payments = [];
     state.logs = [];
+    state.view = 'main';
     try { await idbDel('data'); } catch (e) { console.error(e); }
     render();
     showToast('ابدأ جمعية جديدة');
-  }, 600);
+  }, 1000);
 }
 
 /* ============ Rendering ============ */
@@ -539,13 +691,20 @@ function renderPinScreen() {
     </div>
   </div>`;
 }
+let pinFails = 0, pinLockUntil = 0;
 function pressPin(d) {
+  if (Date.now() < pinLockUntil) { showToast(`محاولات كثيرة — انتظر ${Math.ceil((pinLockUntil - Date.now()) / 1000)} ثانية`); return; }
   if (state.pinInput.length >= 4) return;
   state.pinInput += d;
   if (state.pinInput.length === 4) {
     setTimeout(() => {
-      if (state.pinInput === state.pin) { state.authed = true; state.pinInput = ''; }
-      else { state.pinInput = ''; showToast('رمز خاطئ'); }
+      if (state.pinInput === state.pin) { state.authed = true; state.pinInput = ''; pinFails = 0; }
+      else {
+        state.pinInput = '';
+        pinFails++;
+        if (pinFails >= 5) { pinLockUntil = Date.now() + 30000; pinFails = 0; showToast('5 محاولات خاطئة — انتظر 30 ثانية'); }
+        else showToast('رمز خاطئ');
+      }
       render();
     }, 150);
   } else render();
@@ -717,7 +876,7 @@ function renderMainScreen() {
     const canPay = isDue && enough;
     const progress = Math.min(100, Math.round((v / cur.totalAmount) * 100));
     hero = `<div class="hero-card">
-      <div class="hero-label">الدورة الحالية #${cur.cycleIndex} من ${tc}</div>
+      <div class="hero-label">الدورة الحالية #${esc(cur.cycleIndex)} من ${tc}</div>
       <div class="hero-value">${money(cur.totalAmount)}</div>
       <div class="progress-container"><div class="progress-fill" style="width:${progress}%"></div></div>
       <div class="progress-label"><span>تم جمع ${money(Math.min(v, cur.totalAmount))}</span><span>${progress}%</span></div>
@@ -765,7 +924,7 @@ function renderMainScreen() {
     else { badge = `يحتاج ${fmt(s.neededForCurrent)}`; bc = s.neededForCurrent >= req ? 'badge-danger' : 'badge-warning'; }
     const phoneRow = m.phone ? `<div style="font-size:11px;margin-top:3px;display:flex;gap:8px;flex-wrap:wrap">
       <a href="tel:${esc(m.phone)}" style="color:var(--brand-dark);text-decoration:none" onclick="event.stopPropagation()">📞 ${esc(m.phone)}</a>
-      <a href="https://wa.me/${m.phone.replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" style="color:#25d366;text-decoration:none" onclick="event.stopPropagation()">💬 واتساب</a>
+      <a href="https://wa.me/${String(m.phone).replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" style="color:#25d366;text-decoration:none" onclick="event.stopPropagation()">💬 واتساب</a>
     </div>` : '';
     return `<div class="member-item" onclick="openPaymentModal(${JSON.stringify(m.id).replace(/"/g,'&quot;')})">
       <div class="member-item-left">
@@ -853,6 +1012,32 @@ function renderDailyScreen() {
   </div>`;
 }
 
+/* ============ Payment row (member modal + history) ============ */
+function renderPaymentRow(p, from, showMember) {
+  const idArg = JSON.stringify(p.id).replace(/"/g,'&quot;');
+  const fromArg = JSON.stringify(from).replace(/"/g,'&quot;');
+  const edit = canEditPayment(p.id);
+  const del = canDeletePayment(p.id);
+  let btns;
+  if (!edit.can) {
+    btns = `<button class="btn btn-outline btn-xs" onclick="showToast(${JSON.stringify(edit.reason).replace(/"/g,'&quot;')})" title="مقفل" style="opacity:.55">🔒</button>`;
+  } else {
+    btns = `<button class="btn btn-outline btn-xs" onclick="openEditPaymentModal(${idArg}, ${fromArg})" title="تعديل">✏️</button>`
+      + (del.can
+        ? `<button class="btn btn-danger btn-xs" onclick="deletePayment(${idArg})" title="حذف">🗑</button>`
+        : `<button class="btn btn-outline btn-xs" onclick="showToast(${JSON.stringify(del.reason).replace(/"/g,'&quot;')})" title="لا يمكن الحذف" style="opacity:.55">🗑</button>`);
+  }
+  const who = showMember ? `${esc(state.members.find(m => m.id === p.memberId)?.name || '—')} — ` : '';
+  return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;background:var(--bg);border-radius:8px;margin-bottom:6px;font-size:12px;gap:8px">
+    <div style="flex:1;min-width:0">
+      <div style="font-weight:700">${who}${fmt(p.amount)} <span style="color:var(--muted);font-weight:400;font-size:11px">— 📅 ${formatDate(p.date)}</span></div>
+      <div style="color:var(--muted);font-size:10px;margin-top:2px">🕒 سُجّلت: ${formatDateTime(p.createdAt)}${p.editedAt ? ` • ✏️ عُدّلت: ${formatDateTime(p.editedAt)}` : ''}</div>
+      ${p.note?`<div style="color:var(--muted);font-size:11px;margin-top:2px">${esc(p.note)}</div>`:''}
+    </div>
+    <div style="display:flex;gap:4px;flex-shrink:0">${btns}</div>
+  </div>`;
+}
+
 /* ============ History Screen ============ */
 function renderHistoryScreen() {
   const pc = getPaidCycles();
@@ -863,16 +1048,22 @@ function renderHistoryScreen() {
     : pc.map(c => {
         const r = state.members.find(m => m.id === c.recipientMemberId);
         return `<div style="padding:10px;background:var(--bg);border-radius:10px;margin-bottom:8px">
-          <div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>الدورة ${c.cycleIndex}</strong><span class="badge badge-success">مصروفة</span></div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>الدورة ${esc(c.cycleIndex)}</strong><span class="badge badge-success">مصروفة</span></div>
           <div style="font-size:12px;color:var(--muted)">المستلم: ${esc(r?.name || '—')}</div>
           <div style="font-size:12px;margin-top:4px">المبلغ: <strong>${money(c.totalAmount)}</strong></div>
           <div style="font-size:11px;color:var(--muted);margin-top:4px">تاريخ الصرف: ${formatDate(c.paidAt?.split('T')[0])}</div>
         </div>`;
       }).reverse().join('');
   const lh = state.logs.slice(0, 50).map(l => `<div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:12px">
-    <div style="display:flex;justify-content:space-between"><strong>${esc(l.action)}</strong><span style="color:var(--muted);font-size:11px">${new Date(l.timestamp).toLocaleDateString('ar-EG')}</span></div>
+    <div style="display:flex;justify-content:space-between;gap:8px"><strong>${esc(l.action)}</strong><span style="color:var(--muted);font-size:11px;white-space:nowrap">🕒 ${formatDateTime(l.timestamp)}</span></div>
     <div style="color:var(--muted);margin-top:2px">${esc(l.details)}</div>
+    ${l.paymentDate ? `<div style="color:var(--muted);margin-top:2px;font-size:11px">📅 تاريخ الدفعة: ${formatDate(l.paymentDate)}</div>` : ''}
   </div>`).join('');
+  const allPays = state.payments.slice().sort(comparePaymentsDesc);
+  const ph = allPays.length === 0
+    ? '<div style="color:var(--muted);font-size:13px">لا توجد دفعات</div>'
+    : allPays.slice(0, 100).map(p => renderPaymentRow(p, 'history', true)).join('')
+      + (allPays.length > 100 ? `<div style="color:var(--muted);font-size:11px;text-align:center">يُعرض آخر 100 دفعة — باقي الدفعات في نافذة كل عضو</div>` : '');
   return `<div class="header"><h1>السجل</h1><p>سجل الدورات والحركات</p></div>
     <div class="content">
       <div class="card"><h2 class="card-title">الإحصائيات</h2>
@@ -881,6 +1072,7 @@ function renderHistoryScreen() {
         <div class="stat-row"><span class="stat-label">الدورات</span><span class="stat-value">${pc.length} / ${state.cycles.length}</span></div>
       </div>
       <div class="card"><h2 class="card-title">الدورات المصروفة</h2>${ch}</div>
+      <div class="card"><h2 class="card-title"><span>الدفعات</span><span style="font-size:11px;color:var(--muted);font-weight:400">📅 تاريخ الدفعة • 🕒 وقت التسجيل</span></h2>${ph}</div>
       <div class="card"><h2 class="card-title">سجل الحركات</h2>${lh || '<div style="color:var(--muted);font-size:13px">لا توجد حركات</div>'}</div>
     </div>`;
 }
@@ -902,7 +1094,7 @@ function renderSettingsScreen() {
         <button class="btn btn-outline btn-block" style="margin-top:8px" onclick="setPin()">${state.pin?'🔑 تغيير الرمز':'🔒 تعيين رمز'}</button>
       </div>
       <div class="card"><h2 class="card-title">معلومات</h2>
-        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.2.0</span></div>
+        <div class="stat-row"><span class="stat-label">الإصدار</span><span class="stat-value">1.5.0</span></div>
         <div class="stat-row"><span class="stat-label">التخزين</span><span class="stat-value">IndexedDB</span></div>
         <div class="stat-row"><span class="stat-label">الاسم</span><span class="stat-value">${esc(state.association?.name || '—')}</span></div>
         <div class="stat-row"><span class="stat-label">العملة</span><span class="stat-value">${esc(state.association?.currency || '—')}</span></div>
@@ -929,32 +1121,21 @@ function openPaymentModal(memberId) {
   if (!m) return;
   const s = getMemberStatus(m);
   const pc = getPaidCycles().length;
-  const mp = state.payments.filter(p => p.memberId === memberId).slice().reverse();
+  const mp = state.payments.filter(p => p.memberId === memberId).slice().sort(comparePaymentsDesc);
   const quickAmount = state.association.collectionAmount || s.req;
   const payList = mp.length === 0
     ? '<div style="text-align:center;color:var(--muted);padding:12px;font-size:12px">لا توجد دفعات بعد</div>'
-    : mp.map(p => {
-        const check = canDeletePayment(p.id);
-        const btn = check.can
-          ? `<button class="btn btn-danger btn-xs" onclick="deletePayment(${JSON.stringify(p.id).replace(/"/g,'&quot;')})" title="حذف">🗑</button>`
-          : `<button class="btn btn-outline btn-xs" onclick="showToast(${JSON.stringify(check.reason).replace(/"/g,'&quot;')})" title="مقفل" style="opacity:.55">🔒</button>`;
-        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;background:var(--bg);border-radius:8px;margin-bottom:6px;font-size:12px;gap:8px">
-          <div style="flex:1;min-width:0">
-            <div style="font-weight:700">${fmt(p.amount)} <span style="color:var(--muted);font-weight:400;font-size:11px">— ${formatDate(p.date)}</span></div>
-            ${p.note?`<div style="color:var(--muted);font-size:11px;margin-top:2px">${esc(p.note)}</div>`:''}
-          </div>
-          ${btn}
-        </div>`;
-      }).join('');
+    : mp.map(p => renderPaymentRow(p, 'member', false)).join('');
   const lockNote = pc > 0
-    ? '<div style="background:#fef3c7;padding:8px;border-radius:8px;font-size:11px;color:#92400e;margin-top:8px">💡 الدفعات المرتبطة بدورات مصروفة لا تُحذف لحماية الحسابات المغلقة.</div>'
+    ? '<div style="background:#fef3c7;padding:8px;border-radius:8px;font-size:11px;color:#92400e;margin-top:8px">💡 الدفعات التي سُجّلت قبل آخر صرف (🔒) لا تُعدّل ولا تُحذف لحماية الحسابات المغلقة. لتصحيح نقص فيها سجّل دفعة إضافية.</div>'
     : '';
   const phoneRow = m.phone ? `<div style="display:flex;gap:8px;margin-bottom:10px;font-size:12px">
     <a href="tel:${esc(m.phone)}" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none">📞 اتصال</a>
-    <a href="https://wa.me/${m.phone.replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none;color:#25d366">💬 واتساب</a>
+    <a href="https://wa.me/${String(m.phone).replace(/[^0-9]/g, '')}" target="_blank" rel="noopener" class="btn btn-outline btn-xs" style="flex:1;text-decoration:none;color:#25d366">💬 واتساب</a>
   </div>` : '';
   openModal(`
     <div class="modal-title"><span>📋 دفعات ${esc(m.name)}</span><button class="modal-close" onclick="closeModal()">×</button></div>
+    <button class="btn btn-outline btn-block btn-sm" style="margin-bottom:10px" onclick="openEditMemberModal(${JSON.stringify(memberId).replace(/"/g,'&quot;')})">✏️ تعديل بيانات العضو أو دوره</button>
     <div style="background:var(--brand-light);padding:10px;border-radius:10px;margin-bottom:12px;font-size:12px;color:#065f46">
       <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span>مجموع المدفوع:</span><strong>${money(s.totalPaid)}</strong></div>
       <div style="display:flex;justify-content:space-between"><span>الحالة:</span><strong>${s.neededForCurrent===0?'✅ جاهز للدورة':'يحتاج: '+fmt(s.neededForCurrent)}</strong></div>
@@ -962,13 +1143,16 @@ function openPaymentModal(memberId) {
     ${phoneRow}
     <div class="field"><label class="label">➕ إضافة دفعة</label>
       <div class="quick-amounts">
-        <button onclick="setPayAmount(${quickAmount})">${fmt(quickAmount)}</button>
-        <button onclick="setPayAmount(${quickAmount * 2})">${fmt(quickAmount * 2)}</button>
-        ${s.neededForCurrent > 0 && s.neededForCurrent !== quickAmount ? `<button onclick="setPayAmount(${s.neededForCurrent})">المتبقي (${fmt(s.neededForCurrent)})</button>` : ''}
+        <button onclick="setPayAmount(${Number(quickAmount)})">${fmt(quickAmount)}</button>
+        <button onclick="setPayAmount(${Number(quickAmount) * 2})">${fmt(quickAmount * 2)}</button>
+        ${s.neededForCurrent > 0 && s.neededForCurrent !== quickAmount ? `<button onclick="setPayAmount(${Number(s.neededForCurrent)})">المتبقي (${fmt(s.neededForCurrent)})</button>` : ''}
       </div>
-      <input type="number" class="input" id="pay-amount" placeholder="0" min="1" value="${s.neededForCurrent||''}">
+      <input type="number" class="input" id="pay-amount" placeholder="0" min="1" value="${Number(s.neededForCurrent)||''}">
     </div>
-    <div class="field"><input type="text" class="input" id="pay-note" placeholder="ملاحظة (اختياري)"></div>
+    <div class="row">
+      <div class="field"><label class="label">📅 تاريخ الدفعة</label><input type="date" class="input" id="pay-date" value="${todayISO()}" max="${todayISO()}" min="${esc(getMinPaymentDate())}"></div>
+      <div class="field"><label class="label">ملاحظة</label><input type="text" class="input" id="pay-note" placeholder="اختياري"></div>
+    </div>
     <button class="btn btn-primary btn-block" onclick="submitPayment(${JSON.stringify(memberId).replace(/"/g,'&quot;')})">+ تسجيل الدفعة</button>
     <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px">
       <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:var(--muted)">📜 سجل الدفعات (${mp.length})</div>
@@ -980,6 +1164,204 @@ function openPaymentModal(memberId) {
   setTimeout(() => document.getElementById('pay-amount')?.focus(), 100);
 }
 
+/* ============ Edit Payment ============ */
+function comparePaymentsDesc(a, b) {
+  if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+  return (a.createdAt || '') < (b.createdAt || '') ? 1 : -1;
+}
+let pendingEdit = null;
+
+function openEditPaymentModal(paymentId, from, draft) {
+  const p = state.payments.find(x => x.id === paymentId);
+  if (!p) return;
+  const check = canEditPayment(paymentId);
+  if (!check.can) { showToast(check.reason); return; }
+  const m = state.members.find(x => x.id === p.memberId);
+  const v = draft || { amount: p.amount, date: p.date, note: p.note || '' };
+  const idArg = JSON.stringify(paymentId).replace(/"/g,'&quot;');
+  const fromArg = JSON.stringify(from).replace(/"/g,'&quot;');
+  openModal(`
+    <div class="modal-title"><span>✏️ تعديل دفعة — ${esc(m?.name || '—')}</span><button class="modal-close" onclick="closeEditPayment(${fromArg}, ${JSON.stringify(p.memberId).replace(/"/g,'&quot;')})">×</button></div>
+    <div style="background:var(--bg);padding:10px;border-radius:10px;margin-bottom:12px;font-size:12px">
+      الدفعة الحالية: <strong>${money(p.amount)}</strong> بتاريخ <strong>${formatDate(p.date)}</strong><br>
+      <span style="color:var(--muted);font-size:11px">🕒 سُجّلت: ${formatDateTime(p.createdAt)}</span>
+    </div>
+    <div class="field"><label class="label">المبلغ الصحيح *</label><input type="number" class="input" id="edit-pay-amount" min="1" value="${Number(v.amount)}"></div>
+    <div class="field"><label class="label">📅 تاريخ الدفعة الصحيح *</label><input type="date" class="input" id="edit-pay-date" value="${esc(v.date)}" max="${todayISO()}" min="${esc(getMinPaymentDate())}"></div>
+    <div class="field"><label class="label">ملاحظة</label><input type="text" class="input" id="edit-pay-note" value="${esc(v.note)}"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn btn-outline" onclick="closeEditPayment(${fromArg}, ${JSON.stringify(p.memberId).replace(/"/g,'&quot;')})" style="flex:1">إلغاء</button>
+      <button class="btn btn-primary" onclick="reviewPaymentEdit(${idArg}, ${fromArg})" style="flex:2">متابعة ←</button>
+    </div>
+  `);
+}
+
+function closeEditPayment(from, memberId) {
+  pendingEdit = null;
+  if (from === 'member') openPaymentModal(memberId); else closeModal();
+}
+
+function reviewPaymentEdit(paymentId, from) {
+  const p = state.payments.find(x => x.id === paymentId);
+  if (!p) return;
+  const amount = r2(parseFloat(document.getElementById('edit-pay-amount')?.value));
+  const date = document.getElementById('edit-pay-date')?.value || '';
+  if (!date) { showToast('اختر تاريخ الدفعة'); return; }
+  const note = document.getElementById('edit-pay-note')?.value.trim() || '';
+  if (!amount || amount <= 0) { showToast('أدخل مبلغاً صحيحاً — لحذف الدفعة استخدم زر 🗑'); return; }
+  const dateErr = checkPaymentDate(date);
+  if (dateErr) { showToast(dateErr); return; }
+  if (amount === p.amount && date === p.date && note === (p.note || '')) { showToast('لم تغيّر شيئاً'); return; }
+  const check = checkPaymentChange(paymentId, amount);
+  if (!check.can) { showToast(check.reason); return; }
+
+  pendingEdit = { paymentId, from, amount, date, note };
+  const m = state.members.find(x => x.id === p.memberId);
+  const before = getMemberStatus(m);
+  const diff = r2(amount - p.amount);
+  const vault = getVault();
+  const rowStyle = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;padding:6px 0;border-bottom:1px solid var(--border);align-items:center';
+  const changed = (a, b) => a !== b ? 'color:var(--brand-dark);font-weight:800' : 'color:var(--muted)';
+  const idArg = JSON.stringify(paymentId).replace(/"/g,'&quot;');
+  const fromArg = JSON.stringify(from).replace(/"/g,'&quot;');
+  const totalAfter = r2(before.totalPaid + diff);
+  openModal(`
+    <div class="modal-title"><span>تأكيد تعديل الدفعة</span></div>
+    <div style="font-size:12px;margin-bottom:8px">العضو: <strong>${esc(m?.name || '—')}</strong></div>
+    <div style="font-size:12px;background:var(--bg);padding:10px;border-radius:10px">
+      <div style="${rowStyle};font-weight:700;color:var(--muted)"><span></span><span>قبل</span><span>بعد</span></div>
+      <div style="${rowStyle}"><span>المبلغ</span><span>${fmt(p.amount)}</span><span style="${changed(amount, p.amount)}">${fmt(amount)}</span></div>
+      <div style="${rowStyle}"><span>التاريخ</span><span>${formatDate(p.date)}</span><span style="${changed(date, p.date)}">${formatDate(date)}</span></div>
+      ${note !== (p.note || '') ? `<div style="${rowStyle}"><span>الملاحظة</span><span>${esc(p.note || '—')}</span><span style="color:var(--brand-dark);font-weight:800">${esc(note || '—')}</span></div>` : ''}
+      <div style="${rowStyle}"><span>مجموع ما دفعه العضو</span><span>${fmt(before.totalPaid)}</span><span style="${changed(totalAfter, before.totalPaid)}">${fmt(totalAfter)}</span></div>
+      <div style="${rowStyle};border-bottom:none"><span>الخزينة</span><span>${fmt(vault)}</span><span style="${changed(r2(vault + diff), vault)}">${fmt(r2(vault + diff))}</span></div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">سيُسجَّل هذا التعديل في سجل الحركات مع القيم القديمة والجديدة ووقت التعديل.</div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn btn-outline" onclick="backToPaymentEdit()" style="flex:1">→ رجوع</button>
+      <button class="btn btn-primary" id="confirm-edit-btn" onclick="confirmPaymentEdit()" style="flex:2">✓ تأكيد الحفظ</button>
+    </div>
+  `);
+}
+
+function backToPaymentEdit() {
+  if (!pendingEdit) { closeModal(); return; }
+  const { paymentId, from, amount, date, note } = pendingEdit;
+  openEditPaymentModal(paymentId, from, { amount, date, note });
+}
+
+function confirmPaymentEdit() { return once(doConfirmPaymentEdit); }
+async function doConfirmPaymentEdit() {
+  const e = pendingEdit;
+  if (!e) return;
+  const p = state.payments.find(x => x.id === e.paymentId);
+  if (!p) { pendingEdit = null; closeModal(); showToast('الدفعة غير موجودة'); return; }
+  // Re-check against the current data in case anything changed since the review screen
+  const dateErr = checkPaymentDate(e.date);
+  if (dateErr) { showToast(dateErr); return; }
+  const check = checkPaymentChange(p.id, e.amount);
+  if (!check.can) { showToast(check.reason); return; }
+
+  const m = state.members.find(x => x.id === p.memberId);
+  const now = new Date().toISOString();
+  const parts = [];
+  if (e.amount !== p.amount) parts.push(`المبلغ ${fmt(p.amount)} ← ${fmt(e.amount)}`);
+  if (e.date !== p.date) parts.push(`التاريخ ${formatDate(p.date)} ← ${formatDate(e.date)}`);
+  if (e.note !== (p.note || '')) parts.push(`الملاحظة «${p.note || '—'}» ← «${e.note || '—'}»`);
+  p.history = [...(p.history || []), { amount: p.amount, date: p.date, note: p.note || '', editedAt: now }];
+  p.amount = e.amount;
+  p.date = e.date;
+  p.note = e.note;
+  p.editedAt = now;
+  state.logs.unshift({ id: uid('L'), timestamp: now, action: 'تعديل دفعة', details: `${m?.name || ''}: ${parts.join('، ')}`, paymentDate: e.date });
+  pendingEdit = null;
+  if (!await persist()) { closeModal(); return; }
+  render();
+  if (e.from === 'member') openPaymentModal(p.memberId); else closeModal();
+  showToast('تم حفظ تعديل الدفعة');
+}
+
+/* ============ Edit Member ============ */
+function openEditMemberModal(memberId) {
+  const m = state.members.find(x => x.id === memberId);
+  if (!m) return;
+  const myCycle = state.cycles.find(c => c.recipientMemberId === memberId);
+  const received = myCycle?.status === 'paid';
+  const idArg = JSON.stringify(memberId).replace(/"/g,'&quot;');
+  const orderField = received
+    ? `<div style="font-size:12px;color:var(--muted);background:var(--bg);padding:8px;border-radius:8px">استلم هذا العضو دوره (الدورة ${esc(myCycle.cycleIndex)}) — لا يمكن تغيير دوره.</div>`
+    : `<select class="select" id="edit-order">${state.cycles
+        .filter(c => c.status === 'pending')
+        .sort((a, b) => a.cycleIndex - b.cycleIndex)
+        .map(c => {
+          const r = state.members.find(x => x.id === c.recipientMemberId);
+          const label = c.recipientMemberId === memberId ? '(دوره الحالي)' : `مكان ${esc(r?.name || '—')}`;
+          return `<option value="${Number(c.cycleIndex)}" ${c.recipientMemberId === memberId ? 'selected' : ''}>الدور ${esc(c.cycleIndex)} — ${formatDate(c.dueDate)} ${label}</option>`;
+        }).join('')}</select>
+       <div style="font-size:11px;color:var(--muted);margin-top:4px">عند اختيار دور آخر يتبادل العضوان الدورين.</div>`;
+  const replaceField = received
+    ? ''
+    : `<label style="display:flex;gap:8px;align-items:flex-start;font-size:13px;background:#fef3c7;padding:10px;border-radius:10px;cursor:pointer">
+        <input type="checkbox" id="edit-replace" style="margin-top:3px">
+        <span>هذا <strong>عضو جديد</strong> يحل محل عضو انسحب.<br><span style="font-size:11px;color:#92400e">يأخذ العضو الجديد نفس الدور ونفس الرصيد المدفوع (${money(getMemberStatus(m).totalPaid)}). تسوية هذا المبلغ مع العضو المنسحب تتم بينكم خارج التطبيق.</span></span>
+      </label>`;
+  openModal(`
+    <div class="modal-title"><span>✏️ تعديل العضو</span><button class="modal-close" onclick="openPaymentModal(${idArg})">×</button></div>
+    <div class="field"><label class="label">الاسم *</label><input type="text" class="input" id="edit-name" value="${esc(m.name)}"></div>
+    <div class="field"><label class="label">الهاتف (اختياري)</label><input type="tel" class="input" id="edit-phone" value="${esc(m.phone)}"></div>
+    <div class="field"><label class="label">الدور</label>${orderField}</div>
+    ${replaceField}
+    <div class="row" style="margin-top:12px">
+      <button class="btn btn-outline" onclick="openPaymentModal(${idArg})" style="flex:1">إلغاء</button>
+      <button class="btn btn-primary" onclick="saveMember(${idArg})" style="flex:2">حفظ</button>
+    </div>
+  `);
+}
+
+function saveMember(memberId) { return once(() => doSaveMember(memberId)); }
+async function doSaveMember(memberId) {
+  const m = state.members.find(x => x.id === memberId);
+  if (!m) return;
+  const name = document.getElementById('edit-name')?.value.trim() || '';
+  const phone = document.getElementById('edit-phone')?.value.trim() || '';
+  const newIndex = parseInt(document.getElementById('edit-order')?.value);
+  const isReplace = !!document.getElementById('edit-replace')?.checked;
+  if (!name) { showToast('أدخل اسم العضو'); return; }
+
+  const myCycle = state.cycles.find(c => c.recipientMemberId === memberId);
+  const target = Number.isInteger(newIndex) ? state.cycles.find(c => c.cycleIndex === newIndex) : null;
+  const swap = target && myCycle && target !== myCycle;
+  if (swap && (myCycle.status !== 'pending' || target.status !== 'pending')) { showToast('لا يمكن تغيير دور تم صرفه'); return; }
+
+  const oldName = m.name;
+  const changed = name !== m.name || phone !== m.phone || swap;
+  if (!changed) { openPaymentModal(memberId); return; }
+
+  const now = new Date().toISOString();
+  if (isReplace) {
+    m.previousNames = [...(m.previousNames || []), { name: m.name, phone: m.phone, until: now }];
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'استبدال عضو', details: `${oldName} ← ${name} (الدور ${myCycle?.cycleIndex ?? '—'})` });
+  } else if (name !== m.name || phone !== m.phone) {
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'تعديل عضو', details: name !== oldName ? `${oldName} ← ${name}` : `${name} - تغيير الهاتف` });
+  }
+  m.name = name;
+  m.phone = phone;
+
+  if (swap) {
+    const other = state.members.find(x => x.id === target.recipientMemberId);
+    target.recipientMemberId = m.id;
+    myCycle.recipientMemberId = other.id;
+    m.order = target.cycleIndex;
+    other.order = myCycle.cycleIndex;
+    state.logs.unshift({ id: uid('L'), timestamp: now, action: 'تغيير الدور', details: `${m.name} ↔ ${other.name} (الدور ${target.cycleIndex} و ${myCycle.cycleIndex})` });
+  }
+
+  if (!await persist()) return;
+  render();
+  openPaymentModal(memberId);
+  showToast('تم حفظ التعديل');
+}
+
 function openPayoutModal() {
   const c = getCurrentCycle();
   if (!c) { showToast('لا توجد دورة حالية'); return; }
@@ -988,7 +1370,7 @@ function openPayoutModal() {
   if (v < c.totalAmount) { showToast(`الخزينة ناقصة ${fmt(c.totalAmount - v)}`); return; }
   const r = state.members.find(m => m.id === c.recipientMemberId);
   openModal(`
-    <div class="modal-title"><span>صرف الدورة #${c.cycleIndex}</span><button class="modal-close" onclick="closeModal()">×</button></div>
+    <div class="modal-title"><span>صرف الدورة #${esc(c.cycleIndex)}</span><button class="modal-close" onclick="closeModal()">×</button></div>
     <div style="background:var(--bg);padding:12px;border-radius:12px;margin-bottom:12px;font-size:13px">
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>المستلم:</span><strong>${esc(r?.name || '—')}</strong></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>المبلغ:</span><strong style="color:var(--brand-dark)">${money(c.totalAmount)}</strong></div>
@@ -1001,8 +1383,14 @@ function openPayoutModal() {
   `);
 }
 
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
 /* ============ Init ============ */
 async function init() {
+  // Ask the browser not to auto-delete our data when the device is low on space
+  try { if (navigator.storage?.persist) await navigator.storage.persist(); } catch (e) { console.warn(e); }
   document.getElementById('app').innerHTML = '<div style="padding:60px;text-align:center;color:#64748b"><div style="font-size:32px;margin-bottom:12px">📒</div><div>جارٍ التحميل...</div></div>';
   try {
     await openIndexedDB();
